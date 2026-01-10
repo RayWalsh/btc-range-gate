@@ -7,19 +7,15 @@ Answers ONE question only:
 
 "Is BTC currently in a valid sideways range suitable for range trading?"
 
-Adds a descriptive REGIME LABEL for human interpretation.
-Rules are locked in config.py.
+Uses Coinbase public OHLC data (US-safe).
 This module performs NO trading.
 """
 
 from dataclasses import dataclass
 from typing import List, Tuple
-import requests
 
 import config
-
-
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
+from data_source import Candle, fetch_coinbase_candles
 
 
 # ============================================================
@@ -27,49 +23,9 @@ BINANCE_URL = "https://api.binance.com/api/v3/klines"
 # ============================================================
 
 @dataclass
-class Candle:
-    open_time: int
-    open: float
-    high: float
-    low: float
-    close: float
-
-
-@dataclass
 class RangeDecision:
     decision: str
     reasons: List[str]
-
-
-# ============================================================
-# Data fetch
-# ============================================================
-
-def fetch_candles(limit: int = 80) -> List[Candle]:
-    params = {
-        "symbol": config.SYMBOL,
-        "interval": config.INTERVAL,
-        "limit": limit
-    }
-
-    r = requests.get(BINANCE_URL, params=params, timeout=10)
-    r.raise_for_status()
-
-    data = r.json()
-    candles: List[Candle] = []
-
-    for row in data:
-        candles.append(
-            Candle(
-                open_time=int(row[0]),
-                open=float(row[1]),
-                high=float(row[2]),
-                low=float(row[3]),
-                close=float(row[4]),
-            )
-        )
-
-    return candles
 
 
 # ============================================================
@@ -81,18 +37,22 @@ def percent_change(a: float, b: float) -> float:
 
 
 # ============================================================
+# Data fetch (4H candles from Coinbase)
+# ============================================================
+
+def fetch_candles() -> List[Candle]:
+    # 4H candles, ~10–13 days buffer
+    return fetch_coinbase_candles(
+        granularity=14400,
+        lookback_days=14
+    )
+
+
+# ============================================================
 # Core evaluation logic
 # ============================================================
 
 def evaluate_window(candles: List[Candle], days: int) -> Tuple[bool, List[str]]:
-    """
-    Evaluates whether the most recent <days> window satisfies
-    ALL locked range conditions.
-
-    Returns:
-        (is_valid, diagnostics_and_failures)
-    """
-
     reasons: List[str] = []
 
     needed = days * config.CANDLES_PER_DAY
@@ -167,44 +127,6 @@ def evaluate_window(candles: List[Candle], days: int) -> Tuple[bool, List[str]]:
 
 
 # ============================================================
-# Regime classification (DESCRIPTIVE ONLY)
-# ============================================================
-
-def classify_regime(diagnostics: List[str], decision: str) -> str:
-    """
-    Human-readable market regime label.
-    Does NOT affect trading logic.
-    """
-
-    if decision == "RANGE VALID":
-        return "VALID_RANGE"
-
-    metrics = {}
-    for d in diagnostics:
-        if ":" in d:
-            k, v = d.split(":", 1)
-            metrics[k.strip()] = v.strip()
-
-    closes_inside = float(metrics.get("Closes inside", "0").replace("%", ""))
-    range_width = float(metrics.get("Range width", "0").replace("%", ""))
-    upper_rej = int(metrics.get("Upper rejections", "0"))
-    lower_bnc = int(metrics.get("Lower bounces", "0"))
-    recent_move = float(metrics.get("Recent 2d move", "0").replace("%", ""))
-
-    if recent_move > config.TREND_EXPANSION_PCT:
-        return "DIRECTIONAL_EXPANSION"
-
-    if (
-        closes_inside >= config.MIN_CLOSES_INSIDE_PCT
-        and range_width >= config.MIN_RANGE_WIDTH_PCT
-        and (upper_rej < config.MIN_REJECTIONS or lower_bnc < config.MIN_BOUNCES)
-    ):
-        return "CONTAINED_BUT_UNTESTED"
-
-    return "CHAOTIC_OR_UNSTRUCTURED"
-
-
-# ============================================================
 # Public decision function
 # ============================================================
 
@@ -238,80 +160,11 @@ def range_gate_decision() -> RangeDecision:
 
 
 # ============================================================
-# Synthetic test (guardrail – NOT executed by default)
-# ============================================================
-
-def synthetic_perfect_range_test():
-    """
-    Synthetic candle set that MUST produce RANGE VALID.
-    Used to verify logic integrity (no rule drift).
-    """
-
-    candles: List[Candle] = []
-
-    lower = 100.0
-    upper = 108.0
-    mid = 104.0
-
-    upper_near = upper * (1 - config.PROXIMITY_PCT / 100)
-    lower_near = lower * (1 + config.PROXIMITY_PCT / 100)
-
-    for i in range(42):
-        candles.append(
-            Candle(
-                open_time=i,
-                open=mid,
-                high=mid + 0.3,
-                low=mid - 0.3,
-                close=mid,
-            )
-        )
-
-    for i in [8, 14]:
-        candles[i] = Candle(
-            open_time=i,
-            open=upper_near,
-            high=upper,
-            low=upper_near - 0.5,
-            close=upper_near,
-        )
-
-    for i in [20, 26]:
-        candles[i] = Candle(
-            open_time=i,
-            open=lower_near,
-            high=lower_near + 0.5,
-            low=lower,
-            close=lower_near,
-        )
-
-    for i in range(30, 42):
-        candles[i] = Candle(
-            open_time=i,
-            open=mid,
-            high=mid + 0.2,
-            low=mid - 0.2,
-            close=mid,
-        )
-
-    valid, diagnostics = evaluate_window(candles, days=7)
-
-    print("\nSYNTHETIC RANGE TEST")
-    print("Expected: RANGE VALID")
-    print("Actual:", "RANGE VALID" if valid else "NO RANGE")
-    for d in diagnostics:
-        print("-", d)
-
-
-# ============================================================
 # CLI entry point
 # ============================================================
 
 if __name__ == "__main__":
     decision = range_gate_decision()
-    regime = classify_regime(decision.reasons, decision.decision)
-
     print(decision.decision)
-    print(f"Regime: {regime}")
     for reason in decision.reasons:
         print(f"- {reason}")

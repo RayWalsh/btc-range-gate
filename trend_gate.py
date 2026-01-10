@@ -6,19 +6,15 @@ Purpose:
 Detects CONFIRMED DAILY TRENDS suitable for conservative,
 pullback-based, spot-only participation.
 
+Uses Coinbase public OHLC data (US-safe).
 This module does NOT trade.
-This module does NOT override range_gate.py.
-Default outcome is NO TREND.
 """
 
 from dataclasses import dataclass
-from typing import List, Tuple
-import requests
+from typing import List, Optional
 
 import config
-
-
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
+from data_source import Candle, fetch_coinbase_candles
 
 
 # ============================================================
@@ -26,23 +22,14 @@ BINANCE_URL = "https://api.binance.com/api/v3/klines"
 # ============================================================
 
 @dataclass
-class Candle:
-    open_time: int
-    open: float
-    high: float
-    low: float
-    close: float
-
-
-@dataclass
 class TrendDecision:
     decision: str
-    direction: str | None
+    direction: Optional[str]
     reasons: List[str]
 
 
 # ============================================================
-# Configuration (locked defaults)
+# Configuration (locked)
 # ============================================================
 
 LOOKBACK_DAYS = 8
@@ -52,42 +39,23 @@ MAX_RETRACE_PCT = 50.0
 
 
 # ============================================================
-# Data fetch
-# ============================================================
-
-def fetch_daily_candles(limit: int = 30) -> List[Candle]:
-    params = {
-        "symbol": config.SYMBOL,
-        "interval": "1d",
-        "limit": limit
-    }
-
-    r = requests.get(BINANCE_URL, params=params, timeout=10)
-    r.raise_for_status()
-
-    data = r.json()
-    candles: List[Candle] = []
-
-    for row in data:
-        candles.append(
-            Candle(
-                open_time=int(row[0]),
-                open=float(row[1]),
-                high=float(row[2]),
-                low=float(row[3]),
-                close=float(row[4]),
-            )
-        )
-
-    return candles
-
-
-# ============================================================
 # Helpers
 # ============================================================
 
 def percent_change(a: float, b: float) -> float:
     return (a - b) / b * 100.0
+
+
+# ============================================================
+# Data fetch (Daily candles from Coinbase)
+# ============================================================
+
+def fetch_daily_candles() -> List[Candle]:
+    # Daily candles, ~1 month buffer
+    return fetch_coinbase_candles(
+        granularity=86400,
+        lookback_days=30
+    )
 
 
 # ============================================================
@@ -153,13 +121,12 @@ def evaluate_trend(candles: List[Candle]) -> TrendDecision:
     if direction == "UP":
         peak = max(c.high for c in window)
         trough = min(c.low for c in window)
-        retrace = percent_change(trough, peak)
+        retrace_pct = abs(percent_change(trough, peak))
     else:
         trough = min(c.low for c in window)
         peak = max(c.high for c in window)
-        retrace = percent_change(peak, trough)
+        retrace_pct = abs(percent_change(peak, trough))
 
-    retrace_pct = abs(retrace)
     reasons.append(f"Max retracement: {retrace_pct:.1f}%")
 
     if retrace_pct > MAX_RETRACE_PCT:
