@@ -7,6 +7,7 @@ Answers ONE question only:
 
 "Is BTC currently in a valid sideways range suitable for range trading?"
 
+Adds a descriptive REGIME LABEL for human interpretation.
 Rules are locked in config.py.
 This module performs NO trading.
 """
@@ -166,6 +167,44 @@ def evaluate_window(candles: List[Candle], days: int) -> Tuple[bool, List[str]]:
 
 
 # ============================================================
+# Regime classification (DESCRIPTIVE ONLY)
+# ============================================================
+
+def classify_regime(diagnostics: List[str], decision: str) -> str:
+    """
+    Human-readable market regime label.
+    Does NOT affect trading logic.
+    """
+
+    if decision == "RANGE VALID":
+        return "VALID_RANGE"
+
+    metrics = {}
+    for d in diagnostics:
+        if ":" in d:
+            k, v = d.split(":", 1)
+            metrics[k.strip()] = v.strip()
+
+    closes_inside = float(metrics.get("Closes inside", "0").replace("%", ""))
+    range_width = float(metrics.get("Range width", "0").replace("%", ""))
+    upper_rej = int(metrics.get("Upper rejections", "0"))
+    lower_bnc = int(metrics.get("Lower bounces", "0"))
+    recent_move = float(metrics.get("Recent 2d move", "0").replace("%", ""))
+
+    if recent_move > config.TREND_EXPANSION_PCT:
+        return "DIRECTIONAL_EXPANSION"
+
+    if (
+        closes_inside >= config.MIN_CLOSES_INSIDE_PCT
+        and range_width >= config.MIN_RANGE_WIDTH_PCT
+        and (upper_rej < config.MIN_REJECTIONS or lower_bnc < config.MIN_BOUNCES)
+    ):
+        return "CONTAINED_BUT_UNTESTED"
+
+    return "CHAOTIC_OR_UNSTRUCTURED"
+
+
+# ============================================================
 # Public decision function
 # ============================================================
 
@@ -217,7 +256,6 @@ def synthetic_perfect_range_test():
     upper_near = upper * (1 - config.PROXIMITY_PCT / 100)
     lower_near = lower * (1 + config.PROXIMITY_PCT / 100)
 
-    # 7 days of boring mid-range candles
     for i in range(42):
         candles.append(
             Candle(
@@ -229,7 +267,6 @@ def synthetic_perfect_range_test():
             )
         )
 
-    # Upper rejections
     for i in [8, 14]:
         candles[i] = Candle(
             open_time=i,
@@ -239,7 +276,6 @@ def synthetic_perfect_range_test():
             close=upper_near,
         )
 
-    # Lower bounces
     for i in [20, 26]:
         candles[i] = Candle(
             open_time=i,
@@ -249,7 +285,6 @@ def synthetic_perfect_range_test():
             close=lower_near,
         )
 
-    # Last 2 days flat
     for i in range(30, 42):
         candles[i] = Candle(
             open_time=i,
@@ -274,6 +309,9 @@ def synthetic_perfect_range_test():
 
 if __name__ == "__main__":
     decision = range_gate_decision()
+    regime = classify_regime(decision.reasons, decision.decision)
+
     print(decision.decision)
+    print(f"Regime: {regime}")
     for reason in decision.reasons:
         print(f"- {reason}")
