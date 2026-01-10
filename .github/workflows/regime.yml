@@ -1,0 +1,35 @@
+name: Daily Regime Engine
+
+on:
+  schedule:
+    - cron: "5 0 * * *"   # Runs daily at 00:05 UTC
+  workflow_dispatch:     # Allows manual runs from GitHub UI
+
+jobs:
+  run-regime-engine:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install requests
+
+      - name: Run regime engine
+        run: |
+          python regime_engine.py
+
+      - name: Commit updated log
+        run: |
+          git config user.name "regime-bot"
+          git config user.email "regime-bot@users.noreply.github.com"
+          git add regime_log.csv
+          git commit -m "Daily regime log update" || echo "No changes to commit"
+          git push
