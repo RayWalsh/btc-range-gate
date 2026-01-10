@@ -3,173 +3,183 @@
 Regime Decision Engine
 
 Purpose:
-Combines independent regime gates to determine
-what (if any) trading strategy is appropriate today.
+- Orchestrate range and trend regime gates
+- Enforce strict hierarchy:
+    RANGE > TREND > NO TRADE
+- Print human-readable regime decision
+- Suggest numeric trade plans (text-only)
+- Log regime state daily
+- Log trade plans only when permitted
 
 This module:
-- Does NOT trade
-- Does NOT modify gate logic
-- Defaults to NO ACTIVE STRATEGY
-- Logs one row per run for later review
+- DOES NOT execute trades
+- DOES NOT generate signals
+- DOES NOT optimise parameters
 """
 
-from dataclasses import dataclass
-from typing import List, Optional
 from datetime import datetime, timezone
 import csv
 import os
 
 import range_gate
 import trend_gate
+from trade_plan import (
+    generate_range_trade_plan,
+    generate_trend_trade_plan,
+    log_trade_plan,
+)
 
 
 # ============================================================
-# Configuration
+# FILES
 # ============================================================
 
-LOG_FILE = "regime_log.csv"
-
-
-# ============================================================
-# Data structure
-# ============================================================
-
-@dataclass
-class RegimeDecision:
-    strategy: str
-    regime: str
-    notes: List[str]
-    range_decision: str
-    trend_decision: str
-    trend_direction: Optional[str]
+REGIME_LOG_FILE = "regime_log.csv"
 
 
 # ============================================================
-# Logging
+# REGIME DECISION
 # ============================================================
 
-def log_decision(decision: RegimeDecision) -> None:
-    file_exists = os.path.isfile(LOG_FILE)
+def decide_regime():
+    """
+    Determine the current market regime and allowed strategy.
+    """
 
-    with open(LOG_FILE, mode="a", newline="") as f:
+    range_result = range_gate.range_gate_decision()
+    trend_result = trend_gate.trend_gate_decision()
+
+    # -----------------------------
+    # Hierarchy
+    # -----------------------------
+
+    if range_result.decision == "RANGE VALID":
+        strategy = "RANGE TRADING"
+        regime = "RANGE"
+        reasons = ["Validated sideways range"]
+
+    elif trend_result.decision == "TREND CONFIRMED" and trend_result.direction == "UP":
+        strategy = "TREND PULLBACK"
+        regime = "TREND_UP"
+        reasons = ["Confirmed directional trend with pullback behaviour"]
+
+    else:
+        strategy = "NO ACTIVE STRATEGY"
+        regime = "DRIFT / TRANSITION"
+        reasons = [
+            "No validated range",
+            "No confirmed trend",
+            "Market between regimes",
+            "Standing down",
+        ]
+
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "strategy": strategy,
+        "regime": regime,
+        "reasons": reasons,
+        "range_result": range_result,
+        "trend_result": trend_result,
+    }
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+def append_regime_log(decision: dict):
+    """
+    Append daily regime decision to regime_log.csv
+    """
+
+    file_exists = os.path.isfile(REGIME_LOG_FILE)
+
+    with open(REGIME_LOG_FILE, mode="a", newline="") as f:
         writer = csv.writer(f)
 
-        # Write header once
         if not file_exists:
             writer.writerow([
                 "timestamp_utc",
                 "strategy",
                 "regime",
-                "range_decision",
-                "trend_decision",
-                "trend_direction",
-                "notes"
             ])
 
         writer.writerow([
-            datetime.now(timezone.utc).isoformat(),
-            decision.strategy,
-            decision.regime,
-            decision.range_decision,
-            decision.trend_decision,
-            decision.trend_direction or "",
-            " | ".join(decision.notes)
+            decision["timestamp"],
+            decision["strategy"],
+            decision["regime"],
         ])
 
 
 # ============================================================
-# Core decision engine
+# OUTPUT + TRADE PLAN LOGGING
 # ============================================================
 
-def decide_regime() -> RegimeDecision:
+def print_and_log_decision(decision: dict):
     """
-    Determines which (if any) strategy is appropriate today.
-
-    Priority order:
-    1. RANGE (if validated)
-    2. TREND (if confirmed)
-    3. Otherwise: NO ACTIVE STRATEGY
+    Print regime decision and, when allowed, suggest and log trade plans.
     """
 
-    # --------------------------------------------------------
-    # 1️⃣ Range gate (4H)
-    # --------------------------------------------------------
+    print(f"Strategy: {decision['strategy']}")
+    print(f"Regime: {decision['regime']}")
 
-    range_result = range_gate.range_gate_decision()
+    for r in decision["reasons"]:
+        print(f"- {r}")
 
-    if range_result.decision == "RANGE VALID":
-        return RegimeDecision(
-            strategy="RANGE TRADING",
-            regime="VALID_RANGE (4H)",
-            notes=range_result.reasons,
-            range_decision=range_result.decision,
-            trend_decision="SKIPPED",
-            trend_direction=None
-        )
+    print("")
 
-    # --------------------------------------------------------
-    # 2️⃣ Trend gate (Daily)
-    # --------------------------------------------------------
+    # -----------------------------
+    # RANGE TRADE PLAN
+    # -----------------------------
 
-    daily_candles = trend_gate.fetch_daily_candles()
-    trend_result = trend_gate.evaluate_trend(daily_candles)
+    if decision["strategy"] == "RANGE TRADING":
+        plan = generate_range_trade_plan(decision["range_result"])
 
-    if trend_result.decision == "TREND CONFIRMED":
-        if trend_result.direction == "UP":
-            return RegimeDecision(
-                strategy="TREND PULLBACK (SPOT)",
-                regime="TREND CONFIRMED (DAILY, UP)",
-                notes=trend_result.reasons,
-                range_decision="NO RANGE",
-                trend_decision=trend_result.decision,
-                trend_direction="UP"
-            )
-        else:
-            # Downtrend → explicit stand down
-            return RegimeDecision(
-                strategy="NO ACTIVE STRATEGY",
-                regime="TREND CONFIRMED (DAILY, DOWN)",
-                notes=[
-                    "Daily structure is bearish",
-                    "Long exposure discouraged",
-                    "Standing down"
-                ] + trend_result.reasons,
-                range_decision="NO RANGE",
-                trend_decision=trend_result.decision,
-                trend_direction="DOWN"
-            )
+        print("STRATEGY SUGGESTION: RANGE TRADING (MEAN REVERSION)")
+        print("")
 
-    # --------------------------------------------------------
-    # 3️⃣ Default: Drift / Transition
-    # --------------------------------------------------------
+        for key, value in plan.items():
+            if key in ["strategy", "regime", "notes"]:
+                continue
+            print(f"- {key.replace('_', ' ').title()}: {value:,.0f}")
 
-    return RegimeDecision(
-        strategy="NO ACTIVE STRATEGY",
-        regime="DRIFT / TRANSITION",
-        notes=[
-            "No validated range",
-            "No confirmed trend",
-            "Market between regimes",
-            "Standing down"
-        ],
-        range_decision="NO RANGE",
-        trend_decision="NO TREND",
-        trend_direction=None
-    )
+        print(f"- Notes: {plan['notes']}")
+
+        # Spot reference price = last close inside range
+        spot_price = decision["range_result"].last_close
+        log_trade_plan(plan, spot_price)
+
+    # -----------------------------
+    # TREND TRADE PLAN
+    # -----------------------------
+
+    elif decision["strategy"] == "TREND PULLBACK":
+        plan = generate_trend_trade_plan(decision["trend_result"])
+
+        print("STRATEGY SUGGESTION: TREND PULLBACK (SPOT)")
+        print("")
+
+        for key, value in plan.items():
+            if key in ["strategy", "regime", "notes"]:
+                continue
+            print(f"- {key.replace('_', ' ').title()}: {value:,.0f}")
+
+        print(f"- Notes: {plan['notes']}")
+
+        # Spot reference price = most recent trend high
+        spot_price = decision["trend_result"].trend_high
+        log_trade_plan(plan, spot_price)
 
 
 # ============================================================
-# CLI entry point
+# MAIN ENTRY POINT
 # ============================================================
+
+def main():
+    decision = decide_regime()
+    print_and_log_decision(decision)
+    append_regime_log(decision)
+
 
 if __name__ == "__main__":
-    decision = decide_regime()
-
-    print(f"Strategy: {decision.strategy}")
-    print(f"Regime: {decision.regime}")
-
-    for note in decision.notes:
-        print(f"- {note}")
-
-    # Append to CSV log
-    log_decision(decision)
+    main()

@@ -1,202 +1,167 @@
 # trend_gate.py
 """
-Daily Trend Gate
+Trend Gate
 
 Purpose:
-Detects CONFIRMED DAILY TRENDS suitable for conservative,
-pullback-based, spot-only participation.
-
-Uses Coinbase public OHLC data (US-safe).
-This module does NOT trade.
+- Detect confirmed directional trends (UP only, spot-safe)
+- Conservative, pullback-based logic
+- No execution, no signals
 """
 
 from dataclasses import dataclass
 from typing import List, Optional
-
-import config
 from data_source import Candle, fetch_coinbase_candles
 
 
-# ============================================================
-# Data structures
-# ============================================================
+# -----------------------------
+# CONFIG (LOCKED PHILOSOPHY)
+# -----------------------------
+
+LOOKBACK_DAYS = 10          # evaluation window
+MIN_NET_MOVE_PCT = 4.0      # minimum directional expansion
+MAX_COUNTER_MOVE_PCT = 1.5  # max allowed pullback against trend
+MIN_FAILED_PULLBACKS = 1    # must see at least one failed pullback
+
+
+# -----------------------------
+# DATA STRUCTURES
+# -----------------------------
 
 @dataclass
 class TrendDecision:
-    decision: str
-    direction: Optional[str]
+    decision: str                    # "TREND CONFIRMED" or "NO TREND"
+    direction: Optional[str]         # "UP" or None
     reasons: List[str]
+    trend_origin: Optional[float] = None
+    trend_high: Optional[float] = None
+    net_move_pct: Optional[float] = None
 
 
-# ============================================================
-# Configuration (locked)
-# ============================================================
-
-LOOKBACK_DAYS = 8
-MIN_NET_MOVE_PCT = 4.0
-MIN_BIASED_CLOSES = 5
-MAX_RETRACE_PCT = 50.0
-
-
-# ============================================================
-# Helpers
-# ============================================================
-
-def percent_change(a: float, b: float) -> float:
-    return (a - b) / b * 100.0
-
-
-# ============================================================
-# Data fetch (Daily candles from Coinbase)
-# ============================================================
+# -----------------------------
+# DATA FETCH
+# -----------------------------
 
 def fetch_daily_candles() -> List[Candle]:
-    # Daily candles, ~1 month buffer
+    """
+    Fetch daily candles for trend evaluation.
+    """
     return fetch_coinbase_candles(
         granularity=86400,
-        lookback_days=30
+        lookback_days=LOOKBACK_DAYS + 5  # small buffer
     )
 
 
-# ============================================================
-# Core trend evaluation
-# ============================================================
+# -----------------------------
+# CORE LOGIC
+# -----------------------------
 
 def evaluate_trend(candles: List[Candle]) -> TrendDecision:
-    if len(candles) < LOOKBACK_DAYS + 1:
+    reasons: List[str] = []
+
+    if len(candles) < LOOKBACK_DAYS:
         return TrendDecision(
-            "NO TREND",
-            None,
-            ["Insufficient daily data"]
+            decision="NO TREND",
+            direction=None,
+            reasons=["Insufficient candle data"]
         )
 
     window = candles[-LOOKBACK_DAYS:]
+
     start_price = window[0].close
     end_price = window[-1].close
 
-    net_move_pct = percent_change(end_price, start_price)
+    net_move_pct = ((end_price - start_price) / start_price) * 100
 
-    reasons: List[str] = [
-        f"Net move over {LOOKBACK_DAYS}d: {net_move_pct:.2f}%"
-    ]
+    # -----------------------------
+    # Directional Expansion Check
+    # -----------------------------
 
-    # --------------------------------------------------------
-    # Condition A — Directional expansion
-    # --------------------------------------------------------
-
-    if abs(net_move_pct) < MIN_NET_MOVE_PCT:
+    if net_move_pct < MIN_NET_MOVE_PCT:
+        reasons.append(
+            f"Directional expansion {net_move_pct:.2f}% < {MIN_NET_MOVE_PCT}%"
+        )
         return TrendDecision(
-            "NO TREND",
-            None,
-            reasons + ["Directional expansion below threshold"]
+            decision="NO TREND",
+            direction=None,
+            reasons=reasons,
+            net_move_pct=net_move_pct
         )
 
-    direction = "UP" if net_move_pct > 0 else "DOWN"
-    reasons.append(f"Direction: {direction}")
+    direction = "UP"
 
-    # --------------------------------------------------------
-    # Condition B — Persistence
-    # --------------------------------------------------------
+    # -----------------------------
+    # Pullback Behaviour Check
+    # -----------------------------
 
-    biased_closes = 0
-    for i in range(1, len(window)):
-        if direction == "UP" and window[i].close > window[i - 1].close:
-            biased_closes += 1
-        if direction == "DOWN" and window[i].close < window[i - 1].close:
-            biased_closes += 1
+    trend_high = max(c.high for c in window)
+    trend_origin = window[0].close
+    trend_range = trend_high - trend_origin
 
-    reasons.append(f"Biased closes: {biased_closes} / {LOOKBACK_DAYS - 1}")
-
-    if biased_closes < MIN_BIASED_CLOSES:
-        return TrendDecision(
-            "NO TREND",
-            None,
-            reasons + ["Directional persistence insufficient"]
-        )
-
-    # --------------------------------------------------------
-    # Retracement depth check
-    # --------------------------------------------------------
-
-    if direction == "UP":
-        peak = max(c.high for c in window)
-        trough = min(c.low for c in window)
-        retrace_pct = abs(percent_change(trough, peak))
-    else:
-        trough = min(c.low for c in window)
-        peak = max(c.high for c in window)
-        retrace_pct = abs(percent_change(peak, trough))
-
-    reasons.append(f"Max retracement: {retrace_pct:.1f}%")
-
-    if retrace_pct > MAX_RETRACE_PCT:
-        return TrendDecision(
-            "NO TREND",
-            None,
-            reasons + ["Retracement too deep"]
-        )
-
-    # --------------------------------------------------------
-    # Condition C — Pullback failure
-    # --------------------------------------------------------
-
-    pullback_detected = False
-    pullback_failed = False
-
-    expansion_origin = window[0].close
+    failed_pullbacks = 0
 
     for i in range(1, len(window)):
-        prev = window[i - 1]
-        cur = window[i]
+        candle = window[i]
 
-        if direction == "UP" and cur.close < prev.close:
-            pullback_detected = True
-            if cur.low > expansion_origin:
-                pullback_failed = True
+        pullback_depth = (trend_high - candle.low) / trend_range * 100
 
-        if direction == "DOWN" and cur.close > prev.close:
-            pullback_detected = True
-            if cur.high < expansion_origin:
-                pullback_failed = True
+        # pullback occurs but does NOT break trend origin
+        if 0.5 < pullback_depth <= MAX_COUNTER_MOVE_PCT:
+            if candle.close > trend_origin:
+                failed_pullbacks += 1
 
-    if not pullback_detected:
+    if failed_pullbacks < MIN_FAILED_PULLBACKS:
+        reasons.append(
+            f"Failed pullbacks {failed_pullbacks} < {MIN_FAILED_PULLBACKS}"
+        )
         return TrendDecision(
-            "NO TREND",
-            None,
-            reasons + ["No pullback occurred (too early)"]
+            decision="NO TREND",
+            direction=None,
+            reasons=reasons,
+            net_move_pct=net_move_pct
         )
 
-    if not pullback_failed:
-        return TrendDecision(
-            "NO TREND",
-            None,
-            reasons + ["Pullbacks succeeded in reclaiming structure"]
-        )
-
-    reasons.append("Pullback(s) failed to reverse trend")
-
-    # --------------------------------------------------------
-    # Passed all conditions
-    # --------------------------------------------------------
+    # -----------------------------
+    # TREND CONFIRMED
+    # -----------------------------
 
     return TrendDecision(
-        "TREND CONFIRMED",
-        direction,
-        reasons
+        decision="TREND CONFIRMED",
+        direction=direction,
+        reasons=[],
+        trend_origin=trend_origin,
+        trend_high=trend_high,
+        net_move_pct=net_move_pct
     )
 
 
-# ============================================================
-# CLI entry point
-# ============================================================
+# -----------------------------
+# PUBLIC ENTRY POINT
+# -----------------------------
 
-if __name__ == "__main__":
+def trend_gate_decision() -> TrendDecision:
     candles = fetch_daily_candles()
     decision = evaluate_trend(candles)
 
-    print(decision.decision)
-    if decision.direction:
-        print(f"Direction: {decision.direction}")
+    # Console diagnostics (safe for automation)
+    if decision.decision == "NO TREND":
+        print("NO TREND")
+        for r in decision.reasons:
+            print(f"- {r}")
+        if decision.net_move_pct is not None:
+            print(f"- Net move over {LOOKBACK_DAYS}d: {decision.net_move_pct:.2f}%")
 
-    for r in decision.reasons:
-        print(f"- {r}")
+    else:
+        print("TREND CONFIRMED (UP)")
+        print(f"- Net move over {LOOKBACK_DAYS}d: {decision.net_move_pct:.2f}%")
+        print(f"- Trend origin: {decision.trend_origin:,.0f}")
+        print(f"- Trend high: {decision.trend_high:,.0f}")
+
+    return decision
+
+
+# -----------------------------
+# STANDALONE TEST
+# -----------------------------
+
+if __name__ == "__main__":
+    trend_gate_decision()
