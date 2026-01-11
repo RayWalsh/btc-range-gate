@@ -1,20 +1,10 @@
-# regime_engine.py
 """
-Regime Decision Engine
+regime_engine.py
 
-Purpose:
-- Orchestrate range and trend regime gates
-- Enforce strict hierarchy:
-    RANGE > TREND > NO TRADE
-- Print human-readable regime decision
-- Suggest numeric trade plans (text-only)
-- Log regime state daily
-- Log trade plans only when permitted
+Daily Regime Decision Engine — Research Logging v2 (Robust)
 
-This module:
-- DOES NOT execute trades
-- DOES NOT generate signals
-- DOES NOT optimise parameters
+This version adapts to the *actual* RangeDecision fields
+without modifying range_gate.py.
 """
 
 from datetime import datetime, timezone
@@ -23,163 +13,140 @@ import os
 
 import range_gate
 import trend_gate
-from trade_plan import (
-    generate_range_trade_plan,
-    generate_trend_trade_plan,
-    log_trade_plan,
-)
 
-
-# ============================================================
-# FILES
-# ============================================================
 
 REGIME_LOG_FILE = "regime_log.csv"
 
 
-# ============================================================
-# REGIME DECISION
-# ============================================================
+CSV_HEADER = [
+    "timestamp_utc",
+    "strategy",
+    "regime",
 
-def decide_regime():
-    """
-    Determine the current market regime and allowed strategy.
-    """
+    # Range gate diagnostics
+    "range_decision",
+    "range_window_days",
+    "range_width_pct",
+    "range_closes_inside_pct",
+    "range_upper_tests",
+    "range_lower_tests",
+
+    # Trend gate diagnostics
+    "trend_decision",
+    "trend_direction_bias",
+    "trend_price_then",
+    "trend_price_now",
+    "trend_net_move_pct",
+    "trend_directional_closes",
+    "trend_pullback_observed",
+    "trend_pullback_failed",
+
+    # Readiness states
+    "range_readiness_state",
+    "trend_readiness_state",
+
+    # Future outcomes
+    "post_decision_24h_return_pct",
+    "post_decision_72h_return_pct",
+    "post_decision_7d_return_pct",
+]
+
+
+def ensure_log_file():
+    if not os.path.isfile(REGIME_LOG_FILE):
+        with open(REGIME_LOG_FILE, "w", newline="") as f:
+            csv.writer(f).writerow(CSV_HEADER)
+
+
+def decide_regime_and_log():
+    timestamp = datetime.now(timezone.utc).isoformat()
+    ensure_log_file()
+
+    # ---------------- RANGE GATE ----------------
 
     range_result = range_gate.range_gate_decision()
-    trend_result = trend_gate.trend_gate_decision()
 
-    # -----------------------------
-    # Hierarchy
-    # -----------------------------
+    range_decision = range_result.decision
+    window_days = getattr(range_result, "window_days", None)
+    range_width_pct = getattr(range_result, "range_width_pct", None)
+    closes_inside_pct = getattr(range_result, "closes_inside_pct", None)
+    upper_tests = getattr(range_result, "upper_rejections", None)
+    lower_tests = getattr(range_result, "lower_bounces", None)
 
-    if range_result.decision == "RANGE VALID":
+    if range_decision == "RANGE VALID":
+        range_readiness_state = "RANGE_READY"
+    elif window_days is not None and window_days >= 7:
+        range_readiness_state = "RANGE_CONTAINED_BUT_UNTESTED"
+    else:
+        range_readiness_state = "RANGE_NOT_CONTAINED"
+
+    # ---------------- TREND GATE ----------------
+
+    candles = trend_gate.fetch_daily_candles()
+    trend_result = trend_gate.evaluate_trend(candles)
+    td = trend_result.diagnostics
+
+    if trend_result.decision == "TREND CONFIRMED":
+        trend_readiness_state = "TREND_READY"
+    elif abs(td.get("net_move_pct", 0)) < 4.0:
+        trend_readiness_state = "AWAITING_EXPANSION"
+    elif td.get("pullback_observed") and not td.get("pullback_failed"):
+        trend_readiness_state = "AWAITING_FAILED_PULLBACK"
+    else:
+        trend_readiness_state = "EARLY_DIRECTIONAL_DRIFT"
+
+    # ---------------- REGIME HIERARCHY ----------------
+
+    if range_decision == "RANGE VALID":
         strategy = "RANGE TRADING"
         regime = "RANGE"
-        reasons = ["Validated sideways range"]
-
-    elif trend_result.decision == "TREND CONFIRMED" and trend_result.direction == "UP":
-        strategy = "TREND PULLBACK"
-        regime = "TREND_UP"
-        reasons = ["Confirmed directional trend with pullback behaviour"]
-
+    elif trend_result.decision == "TREND CONFIRMED":
+        strategy = "TREND PULLBACK (SPOT)"
+        regime = f"TREND ({trend_result.direction})"
     else:
         strategy = "NO ACTIVE STRATEGY"
         regime = "DRIFT / TRANSITION"
-        reasons = [
-            "No validated range",
-            "No confirmed trend",
-            "Market between regimes",
-            "Standing down",
-        ]
 
-    return {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "strategy": strategy,
-        "regime": regime,
-        "reasons": reasons,
-        "range_result": range_result,
-        "trend_result": trend_result,
-    }
+    # ---------------- OUTPUT ----------------
 
+    print(f"\nStrategy: {strategy}")
+    print(f"Regime: {regime}")
+    trend_gate.print_trend_progress(trend_result)
 
-# ============================================================
-# LOGGING
-# ============================================================
+    # ---------------- LOG ROW ----------------
 
-def append_regime_log(decision: dict):
-    """
-    Append daily regime decision to regime_log.csv
-    """
+    row = [
+        timestamp,
+        strategy,
+        regime,
 
-    file_exists = os.path.isfile(REGIME_LOG_FILE)
+        range_decision,
+        window_days,
+        range_width_pct,
+        closes_inside_pct,
+        upper_tests,
+        lower_tests,
 
-    with open(REGIME_LOG_FILE, mode="a", newline="") as f:
-        writer = csv.writer(f)
+        trend_result.decision,
+        td.get("direction"),
+        td.get("price_then"),
+        td.get("price_now"),
+        td.get("net_move_pct"),
+        td.get("directional_closes"),
+        td.get("pullback_observed"),
+        td.get("pullback_failed"),
 
-        if not file_exists:
-            writer.writerow([
-                "timestamp_utc",
-                "strategy",
-                "regime",
-            ])
+        range_readiness_state,
+        trend_readiness_state,
 
-        writer.writerow([
-            decision["timestamp"],
-            decision["strategy"],
-            decision["regime"],
-        ])
+        "",
+        "",
+        "",
+    ]
 
-
-# ============================================================
-# OUTPUT + TRADE PLAN LOGGING
-# ============================================================
-
-def print_and_log_decision(decision: dict):
-    """
-    Print regime decision and, when allowed, suggest and log trade plans.
-    """
-
-    print(f"Strategy: {decision['strategy']}")
-    print(f"Regime: {decision['regime']}")
-
-    for r in decision["reasons"]:
-        print(f"- {r}")
-
-    print("")
-
-    # -----------------------------
-    # RANGE TRADE PLAN
-    # -----------------------------
-
-    if decision["strategy"] == "RANGE TRADING":
-        plan = generate_range_trade_plan(decision["range_result"])
-
-        print("STRATEGY SUGGESTION: RANGE TRADING (MEAN REVERSION)")
-        print("")
-
-        for key, value in plan.items():
-            if key in ["strategy", "regime", "notes"]:
-                continue
-            print(f"- {key.replace('_', ' ').title()}: {value:,.0f}")
-
-        print(f"- Notes: {plan['notes']}")
-
-        # Spot reference price = last close inside range
-        spot_price = decision["range_result"].last_close
-        log_trade_plan(plan, spot_price)
-
-    # -----------------------------
-    # TREND TRADE PLAN
-    # -----------------------------
-
-    elif decision["strategy"] == "TREND PULLBACK":
-        plan = generate_trend_trade_plan(decision["trend_result"])
-
-        print("STRATEGY SUGGESTION: TREND PULLBACK (SPOT)")
-        print("")
-
-        for key, value in plan.items():
-            if key in ["strategy", "regime", "notes"]:
-                continue
-            print(f"- {key.replace('_', ' ').title()}: {value:,.0f}")
-
-        print(f"- Notes: {plan['notes']}")
-
-        # Spot reference price = most recent trend high
-        spot_price = decision["trend_result"].trend_high
-        log_trade_plan(plan, spot_price)
-
-
-# ============================================================
-# MAIN ENTRY POINT
-# ============================================================
-
-def main():
-    decision = decide_regime()
-    print_and_log_decision(decision)
-    append_regime_log(decision)
+    with open(REGIME_LOG_FILE, "a", newline="") as f:
+        csv.writer(f).writerow(row)
 
 
 if __name__ == "__main__":
-    main()
+    decide_regime_and_log()
